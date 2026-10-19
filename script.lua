@@ -12,7 +12,8 @@ local Config = {
     TapsPerSecond = 20,
 
     -- HATCH
-    HatchCount = 3,            -- eggs per hatch (3 = R key). 8 is a gamepass, not used.
+    HatchCount = 0,            -- eggs per hatch. 0 = auto: 8 if the account has the 8-hatch gamepass, else 3
+    HatchCountTry = {8, 3},    -- auto: biggest first; the game's answer tells what the account can do
     HatchDelay = 0.2,          -- seconds between hatch requests (lower = faster; the server still has its own limit)
     -- hatch animation (game setting "HatchAnimation", values 1 / 2 / 3). 2 and 3 still show it, so 1 is used.
     -- If it is still there: turn it off ONCE in the game's settings while the script runs; it learns it.
@@ -155,7 +156,7 @@ local Config = {
     Debug = true,
 }
 
-local VERSION = "v2.25-19.10"
+local VERSION = "v2.26-19.10"
 
 -- stop any older copy
 getgenv().TapSimId = (rawget(getgenv(), "TapSimId") or 0) + 1
@@ -689,8 +690,10 @@ local LocalHatched = {}
 local HatchStats = {Hatches = 0, Taps = 0, Rebirths = 0, Skills = 0}
 local Session = {Start = os.clock(), Hatched = 0, Rebirths = 0}
 
+local LastHatchAnswer
 if R.HatchResult then
     R.HatchResult.OnClientEvent:Connect(function(Data)
+        LastHatchAnswer = Data
         if type(Data) == "table" and Data.Success and Data.Egg then
             local N = tonumber(Data.Rolls) or tonumber(Data.Count) or 1
             LocalHatched[Data.Egg] = (LocalHatched[Data.Egg] or 0) + N
@@ -1651,6 +1654,50 @@ local function ShouldSkip(S)
     return StageDone(S)
 end
 
+-- how many eggs per hatch this account can open (8 with the gamepass, else 3)
+local MaxHatch = tonumber(Config.HatchCount) ~= 0 and tonumber(Config.HatchCount) or tonumber(Save.MaxHatch)
+local HatchTryIndex = 1
+
+local function SetMaxHatch(N, Why)
+    MaxHatch = N
+    Save.MaxHatch = N
+    WriteSave()
+    print(("[TapSim] eggs per hatch: %d (%s)"):format(N, Why))
+end
+
+local function HatchCount()
+    return MaxHatch or 3
+end
+
+local function NextHatchTry()
+    return Config.HatchCountTry[HatchTryIndex] or 3
+end
+
+-- the gamepass list may already tell it
+if not MaxHatch then
+    pcall(function()
+        local Data = D()
+        local Found = {}
+        local function Scan(T, Depth)
+            if type(T) ~= "table" or Depth > 3 then return end
+            for K, V in pairs(T) do
+                local Text = (tostring(K) .. " " .. (type(V) ~= "table" and tostring(V) or "")):lower()
+                if Text:find("hatch") then table.insert(Found, tostring(K) .. "=" .. tostring(V)) end
+                -- only the NAME counts (a value like HatchSpeed = 8 is not the gamepass)
+                local Key = tostring(K):lower()
+                if type(K) == "number" and type(V) == "string" then Key = V:lower() end   -- list of gamepass names
+                if type(V) ~= "table" and (((Key:find("8") or Key:find("eight")) and Key:find("hatch")) or Key:find("octo")) then
+                    if V ~= false and V ~= 0 and V ~= nil then MaxHatch = 8 end
+                end
+                Scan(V, Depth + 1)
+            end
+        end
+        Scan(Data and Data.Monetization, 0)
+        Log("[TapSim] hatch gamepass data: " .. (#Found > 0 and table.concat(Found, ", ") or "none"))
+        if MaxHatch then SetMaxHatch(MaxHatch, "8-hatch gamepass found") end
+    end)
+end
+
 local function RunHatch(S)
     local Egg = S.Final and FinalEgg or S.Egg
     if S.Final then SetAutoDelete(FinalEgg, FinalDeleteList()) end
@@ -1661,7 +1708,13 @@ local function RunHatch(S)
 
         while MoveLock and IsActive() do task.wait(0.2) end
         GoToEgg(Egg)
-        local Count = S.Count or Config.HatchCount
+        local Count = S.Count or HatchCount()
+        local Testing = false
+        -- auto hatch count not known yet: try the next bigger count once (if the coins are there)
+        if not S.Count and not MaxHatch and Price and Coins() >= Price * NextHatchTry() then
+            Count = NextHatchTry()
+            Testing = true
+        end
         local Price = EggPrice(Egg)
 
         -- step wants a minimum total of rebirths before this egg
@@ -1703,7 +1756,24 @@ local function RunHatch(S)
 
         SetStatus("hatching " .. Egg)
         HatchSeq += 1
+        LastHatchAnswer = nil
         Fire(R.Hatch, {Egg = Egg, Count = Count, Seq = HatchSeq, Auto = false})
+
+        if Testing then
+            local Deadline = os.clock() + 4
+            repeat task.wait(0.1) until LastHatchAnswer or os.clock() > Deadline
+            local A = LastHatchAnswer
+            local Got = A and A.Success and (tonumber(A.Rolls) or tonumber(A.Count)) or nil
+            if Got and Got >= Count then
+                SetMaxHatch(Count, "the game hatched " .. Got)
+            elseif Got then
+                SetMaxHatch(Got, "the game hatched only " .. Got)
+            else
+                HatchTryIndex += 1
+                Log(("[TapSim] %d-hatch refused (%s), trying smaller"):format(Count, A and tostring(A.Reason or A.Error) or "no answer"))
+                if HatchTryIndex > #Config.HatchCountTry then SetMaxHatch(3, "fallback") end
+            end
+        end
 
         if os.clock() - LastEquip > 10 then
             LastEquip = os.clock()

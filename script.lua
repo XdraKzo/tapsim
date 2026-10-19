@@ -156,7 +156,7 @@ local Config = {
     Debug = true,
 }
 
-local VERSION = "v2.26-19.10"
+local VERSION = "v2.27-19.10"
 
 -- stop any older copy
 getgenv().TapSimId = (rawget(getgenv(), "TapSimId") or 0) + 1
@@ -284,6 +284,7 @@ end
 -- HOOK: follow the game's own sequence numbers + learn requests done by hand
 ----------------------------------------------------------------
 local TapSeq, HatchSeq, DeleteBatch = 0, 0, 0
+local EggSpySeen = {}
 
 local OldNamecall
 OldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
@@ -297,6 +298,20 @@ OldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
             elseif self == R.Hatch and type(Data) == "table" then
                 local N = tonumber(Data.Seq)
                 if N and N > HatchSeq then HatchSeq = N end
+                -- the game's own hatch (E / R / T key): learn the biggest count and any extra fields
+                local C = tonumber(Data.Count)
+                if C and C > (tonumber(Learned.HatchMax) or 0) then
+                    local Extra = {}
+                    for K, V in pairs(Data) do
+                        if K ~= "Egg" and K ~= "Count" and K ~= "Seq" and K ~= "Auto" and type(V) ~= "table" then Extra[K] = V end
+                    end
+                    Learned.HatchMax = C
+                    Learned.HatchExtra = Extra
+                    pcall(function()
+                        if writefile then writefile(LearnFile, HttpService:JSONEncode(Learned)) end
+                    end)
+                    print(("[TapSim] learned: the game hatches %d at once (request %s)"):format(C, Dump(Data, 0, 2)))
+                end
             elseif self == R.PetAction and type(Data) == "table" then
                 local N = tonumber(Data.Batch)
                 if N and N > DeleteBatch then DeleteBatch = N end
@@ -313,6 +328,11 @@ OldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
                 end
             elseif self == R.IslandUnlock then
                 Learn("IslandUnlock", table.pack(...))
+            elseif self.Parent and self.Parent.Parent and self.Parent.Parent.Name == "EggService" and self ~= R.AutoDelete then
+                EggSpySeen[self.Name] = (EggSpySeen[self.Name] or 0) + 1
+                if EggSpySeen[self.Name] <= 5 then
+                    print(("[TapSim] game egg request %s: %s"):format(self.Name, Dump(table.pack(...), 0, 3)))
+                end
             end
         elseif Method == "InvokeServer" and self == R.JumpBuy then
             Learn("DoubleJump", table.pack(...))
@@ -1655,7 +1675,10 @@ local function ShouldSkip(S)
 end
 
 -- how many eggs per hatch this account can open (8 with the gamepass, else 3)
-local MaxHatch = tonumber(Config.HatchCount) ~= 0 and tonumber(Config.HatchCount) or tonumber(Save.MaxHatch)
+-- learned from your own T-key hatch > saved 8 > test; a saved 3 is tested again (it may have been wrong)
+local MaxHatch = tonumber(Config.HatchCount) ~= 0 and tonumber(Config.HatchCount)
+    or tonumber(Learned.HatchMax)
+    or ((tonumber(Save.MaxHatch) or 0) > 3 and tonumber(Save.MaxHatch) or nil)
 local HatchTryIndex = 1
 
 local function SetMaxHatch(N, Why)
@@ -1666,6 +1689,9 @@ local function SetMaxHatch(N, Why)
 end
 
 local function HatchCount()
+    if tonumber(Config.HatchCount) == 0 and tonumber(Learned.HatchMax) and Learned.HatchMax > (MaxHatch or 0) then
+        MaxHatch = Learned.HatchMax
+    end
     return MaxHatch or 3
 end
 
@@ -1757,7 +1783,11 @@ local function RunHatch(S)
         SetStatus("hatching " .. Egg)
         HatchSeq += 1
         LastHatchAnswer = nil
-        Fire(R.Hatch, {Egg = Egg, Count = Count, Seq = HatchSeq, Auto = false})
+        local Request = {Egg = Egg, Count = Count, Seq = HatchSeq, Auto = false}
+        if Count > 3 and type(Learned.HatchExtra) == "table" then
+            for K, V in pairs(Learned.HatchExtra) do Request[K] = V end
+        end
+        Fire(R.Hatch, Request)
 
         if Testing then
             local Deadline = os.clock() + 4
